@@ -1,0 +1,56 @@
+name: Codex iPhone compile probe
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      TARGET: aarch64-apple-ios
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Fetch pinned upstream Codex
+        uses: actions/checkout@v4
+        with:
+          repository: openai/codex
+          ref: 7642e80723386d113ee5c95647164f72e3d68d6d
+          persist-credentials: false
+      - name: Check iPhone SDK and install pinned Rust toolchain
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            git rev-parse HEAD
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            df -h .
+            toolchain=$(python3 -c 'import re; print(re.search(r"(?m)^channel\s*=\s*\"([^\"]+)\"", open("rust-toolchain.toml").read())[1])')
+            rustup toolchain install "$toolchain" --profile minimal --target "$TARGET"
+            echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
+            rustc +"$toolchain" -Vv
+            command -v protoc || brew install protobuf
+          } 2>&1 | tee "$RUNNER_TEMP/setup.log"
+      - name: Compile official app-server library for iPhone
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p codex-app-server --lib --target "$TARGET" 2>&1 | tee "$RUNNER_TEMP/build.log"
+          test -s "target/$TARGET/debug/libcodex_app_server.rlib"
+      - name: Save available logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-ios-probe-logs
+          path: |
+            ${{ runner.temp }}/setup.log
+            ${{ runner.temp }}/build.log
+          retention-days: 7
+          if-no-files-found: warn
