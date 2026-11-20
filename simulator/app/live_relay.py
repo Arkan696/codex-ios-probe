@@ -15,7 +15,7 @@ class RelayError(RuntimeError):
 _INSTRUCTION = '把会议改到周四下午两点，其他内容不变。'
 _HOST = 'new.maoyu.cfd'
 _ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}')
-_MINI = re.compile(r'gpt-[0-9]+(?:\.[0-9]+|o)?-mini(?:-\d{4}-\d{2}-\d{2})?')
+_MODEL = 'deepseek-v4.1-flash-Uncensored'
 
 
 def _unique(pairs):
@@ -53,17 +53,6 @@ def _api(key, path, payload, limit):
             return _json(response, limit)
     finally:
         conn.close()
-
-
-def _select(catalog):
-    ids = {entry['id'] for entry in catalog['data']}
-    minis = sorted(i for i in ids if _MINI.fullmatch(i))
-    for model in ('deepseek-v4-flash', 'deepseek-v4-flash-0731', 'glm-5.3-flash',
-                  'gpt-4o-mini', 'gpt-4.1-mini', *minis, 'mistral-small-latest',
-                  'ministral-8b-latest', 'qwen3.8-27b', 'minimax-m3', 'gpt-6.2-astra'):
-        if model in ids:
-            return model
-    raise RelayError('Live relay: no supported text model advertised')
 
 
 def _extract(response, nonce, key):
@@ -106,12 +95,10 @@ def service(container: Path, nonce: str, key: str) -> None:
             raise RelayError('Live relay: invalid local request')
         if not isinstance(key, str) or not re.fullmatch(r'[!-~]{1,4096}', key):
             raise RelayError('Live relay: invalid credential')
-        phase = 'model discovery failed'
-        model = _select(_api(key, '/v1/models', None, 128 * 1024))
         phase = 'generation failed or malformed response'
         messages = [dict(role='system', content='Return only the full edited document. Keep the original language, 24-hour time format and line breaks. No markdown or explanation.'),
                     dict(role='user', content=req['instruction'] + '\n\n' + req['original'])]
-        result = _api(key, '/v1/chat/completions', dict(model=model, messages=messages,
+        result = _api(key, '/v1/chat/completions', dict(model=_MODEL, messages=messages,
                       max_tokens=512, stream=False), 32 * 1024)
         record = _extract(result, nonce, key)
         phase = 'could not publish response'
