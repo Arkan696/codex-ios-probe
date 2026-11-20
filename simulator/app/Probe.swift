@@ -1,11 +1,15 @@
 import Foundation
 import UIKit
+import CryptoKit
 
 private struct ResultRecord: Codable {
     let runID: String
     let code: Int32
     let uuid: String?
     let error: String?
+    let byteCount: Int?
+    let expectedSHA256: String
+    let receivedSHA256: String?
 }
 
 // This is deliberately outside the UI types: all filesystem and native work
@@ -15,6 +19,9 @@ private func performProbe(runID: String) throws -> ResultRecord {
                                                 appropriateFor: nil, create: true)
     let home = documents.appendingPathComponent("home-\(ProcessInfo.processInfo.globallyUniqueString)", isDirectory: true)
     try FileManager.default.createDirectory(at: home, withIntermediateDirectories: false)
+    var rng = SystemRandomNumberGenerator()
+    let expected = Data((0..<32).map { _ in UInt8.random(in: 0...255, using: &rng) })
+    try expected.write(to: home.appendingPathComponent("challenge.bin"), options: .atomic)
     var bytes = [CChar](repeating: -1, count: 4096)
     let code = home.path.withCString { path in
         bytes.withUnsafeMutableBufferPointer { codex_probe(path, $0.baseAddress!, $0.count) }
@@ -22,12 +29,15 @@ private func performProbe(runID: String) throws -> ResultRecord {
     let text = bytes.firstIndex(of: 0).flatMap { end in
         String(bytes: bytes[..<end].map { UInt8(bitPattern: $0) }, encoding: .utf8)
     }
-    let id = text.flatMap(UUID.init(uuidString:))
-    let valid = code == 0 && id != nil && text?.utf8.count == 36 &&
-        text?.lowercased() == id?.uuidString.lowercased() &&
-        text != "00000000-0000-0000-0000-000000000000"
-    let record = ResultRecord(runID: runID, code: code, uuid: valid ? text : nil,
-                              error: valid ? nil : (code == 0 ? "Invalid UUID from probe" : (text ?? "Native probe failed")))
+    struct NativeReply: Decodable { let uuid: String; let base64: String }
+    let reply = text.flatMap { try? JSONDecoder().decode(NativeReply.self, from: Data($0.utf8)) }
+    let actual = reply.flatMap { Data(base64Encoded: $0.base64) }
+    let id = reply.flatMap { UUID(uuidString: $0.uuid) }
+    let valid = code == 0 && id != nil && actual == expected
+    func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+    let record = ResultRecord(runID: runID, code: valid ? 0 : (code == 0 ? 1 : code), uuid: id?.uuidString.lowercased(),
+                              error: valid ? nil : (code == 0 ? "Invalid UUID or fs/readFile byte mismatch" : (text ?? "Native probe failed")),
+                              byteCount: actual?.count, expectedSHA256: digest(expected), receivedSHA256: actual.map(digest))
     try JSONEncoder().encode(record).write(to: documents.appendingPathComponent("probe-result.json"), options: .atomic)
     return record
 }

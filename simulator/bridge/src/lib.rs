@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result, anyhow, ensure};
 use codex_app_server::in_process::{self, InProcessClientHandle, InProcessStartArgs};
-use codex_app_server_protocol::{ClientInfo, ClientRequest, InitializeParams, RequestId, ThreadStartParams, ThreadStartResponse};
+use codex_app_server_protocol::{ClientInfo, ClientRequest, FsReadFileParams, FsReadFileResponse, InitializeParams, RequestId, ThreadStartParams, ThreadStartResponse};
 use codex_config::{LoaderOverrides, NoopThreadConfigLoader};
 use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
@@ -34,7 +34,7 @@ async fn start(home: &Path) -> Result<InProcessClientHandle> {
         .loader_overrides(loader_overrides.clone())
         .cli_overrides(cli_overrides.clone())
         .build().await.context("load probe config")?;
-    let environment_manager = Arc::new(EnvironmentManager::without_environments(config.http_client_factory()));
+    let environment_manager = Arc::new(EnvironmentManager::from_codex_home(home, None, config.http_client_factory()).await.context("configure local filesystem")?);
     let args = InProcessStartArgs {
         arg0_paths: Default::default(),
         config: Arc::new(config),
@@ -64,7 +64,7 @@ async fn start(home: &Path) -> Result<InProcessClientHandle> {
     Ok(Box::pin(in_process::start(args)).await.context("initialize embedded app-server")?)
 }
 
-async fn probe(home: &Path) -> Result<ThreadId> {
+async fn probe(home: &Path) -> Result<String> {
     let client = timeout(DEADLINE, start(home)).await.context("app-server startup timed out")??;
     let request = ClientRequest::ThreadStart {
         request_id: RequestId::Integer(1), // initialize uses 0
@@ -74,18 +74,26 @@ async fn probe(home: &Path) -> Result<ThreadId> {
             ..Default::default()
         },
     };
-    let reply = timeout(DEADLINE, client.request(request)).await;
-    // Always attempt graceful shutdown, including on timeout or RPC error.
+    let result: Result<String> = async {
+        let value = timeout(DEADLINE, client.request(request)).await.context("thread/start timed out")?
+            .context("thread/start transport")?.map_err(|e| anyhow!("thread/start RPC {}: {}", e.code, e.message))?;
+        let response: ThreadStartResponse = serde_json::from_value(value)?;
+        let id = ThreadId::from_string(&response.thread.id)?;
+        // Hard-coded relative name under the fresh test container; no caller-supplied path.
+        let params = FsReadFileParams { path: home.join("challenge.bin").try_into()? };
+        let request = ClientRequest::FsReadFile { request_id: RequestId::Integer(2), params };
+        let value = timeout(DEADLINE, client.request(request)).await.context("fs/readFile timed out")?
+            .context("fs/readFile transport")?.map_err(|e| anyhow!("fs/readFile RPC {}: {}", e.code, e.message))?;
+        let read: FsReadFileResponse = serde_json::from_value(value)?;
+        Ok(serde_json::json!({"uuid":id.to_string(),"base64":read.data_base64}).to_string())
+    }.await;
     let shutdown = client.shutdown().await;
-    let value = reply.context("thread/start timed out")?.context("thread/start transport")?
-        .map_err(|err| anyhow!("thread/start RPC {}: {}", err.code, err.message))?;
-    let response: ThreadStartResponse = serde_json::from_value(value).context("decode thread/start response")?;
-    let id = ThreadId::from_string(&response.thread.id).context("invalid thread/start UUID")?;
+    let reply = result?;
     shutdown.context("shut down embedded app-server")?;
-    Ok(id)
+    Ok(reply)
 }
 
-fn run(home: PathBuf) -> Result<ThreadId> {
+fn run(home: PathBuf) -> Result<String> {
     ensure!(home.is_absolute(), "home must be an absolute directory path");
     std::fs::create_dir_all(&home).context("create probe home")?;
     // Do not nest block_on in the caller's runtime or poll Codex startup on an iOS UI stack.
@@ -98,23 +106,24 @@ fn run(home: PathBuf) -> Result<ThreadId> {
     }).context("spawn probe worker")?.join().map_err(|_| anyhow!("probe worker panicked"))?
 }
 
-/// Blocks until thread/start and server shutdown complete. Returns 0 for a UUID, 1 for an error.
+/// Blocks until thread/start and server shutdown complete. Returns 0 for a JSON reply, 1 for an error.
 ///
 /// # Safety
 /// `home` must be null or a readable NUL-terminated UTF-8 string. `out` must be null or
 /// writable for `cap` bytes, exclusive of other accesses. Use a fresh app-writable home.
-/// Success requires at least 37 output bytes. Diagnostics may be truncated to fit.
+/// Use a 4096-byte output buffer. Diagnostics may be truncated to fit.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn codex_probe(home: *const c_char, out: *mut c_char, cap: usize) -> i32 {
     if out.is_null() || cap == 0 { return 1; }
-    let result = std::panic::catch_unwind(|| -> Result<ThreadId> {
-        ensure!(cap >= 37, "need 37 output bytes");
+    let result = std::panic::catch_unwind(|| -> Result<String> {
+        ensure!(cap >= 4096, "need 4096 output bytes");
         ensure!(!home.is_null(), "home is null");
         let path = unsafe { CStr::from_ptr(home) }.to_str().context("home is not UTF-8")?;
         run(PathBuf::from(path))
     });
     let (status, text) = match result {
-        Ok(Ok(id)) => (0, id.to_string()),
+        Ok(Ok(reply)) if reply.len() < cap => (0, reply),
+        Ok(Ok(_)) => (1, "reply exceeds buffer".into()),
         Ok(Err(error)) => (1, format!("{error:#}")),
         Err(_) => (1, "panic in codex_probe".to_owned()),
     };

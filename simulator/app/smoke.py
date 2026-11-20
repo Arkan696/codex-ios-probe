@@ -105,6 +105,9 @@ def validate(record, nonce):
     parsed = uuid.UUID(text)
     if not parsed.int or str(parsed) != text.lower():
         raise ValueError('Expected canonical non-nil session UUID')
+    digest = record.get('expectedSHA256', '')
+    if record.get('byteCount') != 32 or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest) or digest != record.get('receivedSHA256'):
+        raise ValueError('No matching 32-byte fs/readFile evidence')
     return text
 
 
