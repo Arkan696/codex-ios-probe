@@ -149,6 +149,11 @@ def validate(record, nonce):
 
 
 def smoke(lib, flags):
+    live = os.environ.get('LIVE_PROPOSAL') == '1'
+    key = os.environ.pop('MODEL_API_KEY', '')  # do not inherit into Xcode, simctl or app
+    if live and (not key or os.environ.get('MODEL_BASE_URL', '').rstrip('/') != 'https://new.maoyu.cfd'):
+        raise ValueError('Live test requires the configured secret and approved HTTPS origin')
+    attempted = False
     if platform.system() != 'Darwin':
         raise RuntimeError('Requires macOS, full Xcode and an installed iPhone simulator runtime')
     arch = os.getenv('SIM_ARCH', platform.machine())
@@ -166,18 +171,34 @@ def smoke(lib, flags):
             raise ValueError(f'Unexpected simulator data container: {container}')
         result = container / 'Documents/probe-result.json'
         try:
-            sim('launch', '--terminate-running-process', udid, BUNDLE, '--probe', '--run-id', nonce)
+            extra = ['--live-proposal'] if live else []
+            sim('launch', '--terminate-running-process', udid, BUNDLE, '--probe', '--run-id', nonce, *extra)
         except subprocess.TimeoutExpired:
             # The simulator may already have delivered the launch. Do not relaunch.
             with (out / 'runner.log').open('a') as log:
                 print('simctl launch timed out; checking only this run ID for 300s', file=log)
         deadline = time.monotonic() + 300  # read regression plus both decision paths
         while time.monotonic() < deadline:
+            if live and not attempted and (container / 'Documents/live-request.json').exists():
+                from live_relay import service
+                attempted = True  # single-use latch before any network I/O
+                service(container, nonce, key)
+                key = ''
             if result.exists():
                 raw = result.read_bytes()  # App publishes by atomic rename.
                 record = json.loads(raw)
                 if record.get('runID') == nonce:
                     (out / 'result.json').write_bytes(raw)
+                    if live:
+                        import hashlib
+                        proof = record.get('live') or {}
+                        if not attempted or not proof or not proof.get('responseID') or not proof.get('model'):
+                            raise ValueError(record.get('error') or 'No evidence of a real provider response')
+                        wire = json.loads((container / 'Documents/live-response.json').read_bytes())
+                        h = lambda s: hashlib.sha256(s.encode('utf-8')).hexdigest()
+                        a = record.get('approval') or {}
+                        if not (wire['runID'] == nonce and wire['model'] == proof['model'] and wire['responseID'] == proof['responseID'] and h(wire['candidate']) == proof['candidateSHA256'] == a.get('previewSHA256') and h(f'Meeting: Tuesday at 10:00\nReference: {nonce}') == proof['beforeApprovalSHA256'] == a.get('beforeSHA256')):
+                            raise ValueError('Live model evidence does not match approved bytes')
                     print('Session UUID:', validate(record, nonce), flush=True)
                     return
             time.sleep(0.5)

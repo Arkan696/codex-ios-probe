@@ -7,6 +7,10 @@ private struct Approval: Codable {
     var rejectedWrites, approvedWrites: Int?
 }
 
+private struct LiveEvidence: Codable {
+    let model, responseID, candidateSHA256, beforeApprovalSHA256: String
+}
+
 private struct ResultRecord: Codable {
     let runID: String
     var code: Int32 = 0
@@ -14,6 +18,7 @@ private struct ResultRecord: Codable {
     var byteCount: Int?
     var expectedSHA256, receivedSHA256: String?
     var approval = Approval()
+    var live: LiveEvidence?
 }
 
 private struct Failure: LocalizedError {
@@ -79,15 +84,68 @@ private func edit(_ home: URL, approved: Data? = nil) throws -> Reply {
     return reply
 }
 
-// Setup is explicit in manual mode. This seeds only a newly created demo home; it never applies the edit.
-private func makeReviewProposal() throws -> Proposal {
+private func seedReview(_ original: Data) throws -> (home: URL, before: Data) {
     let home = try freshHome()
-    let original = Data("Meeting: Tuesday at 10:00".utf8)
-    let proposed = Data("Meeting: Thursday at 14:00".utf8)
     try original.write(to: home.appendingPathComponent(documentName), options: .withoutOverwriting)
     let before = try edit(home).bytes
-    guard before == original, before != proposed else { throw Failure("Wrong initial document") }
-    return Proposal(home: home, before: before, after: proposed)
+    guard before == original else { throw Failure("Wrong initial document") }
+    return (home, before)
+}
+
+// Setup is explicit in manual mode; seeding the private home never applies the edit.
+private func makeReviewProposal() throws -> Proposal {
+    let (home, before) = try seedReview(Data("Meeting: Tuesday at 10:00".utf8))
+    return Proposal(home: home, before: before, after: Data("Meeting: Thursday at 14:00".utf8))
+}
+
+private struct LiveRequest: Encodable {
+    let runID, original: String
+    let instruction = "把会议改到周四下午两点，其他内容不变。"
+}
+
+private struct LiveReply: Decodable {
+    let runID: String
+    let candidate, model, responseID, error: String?
+}
+
+// Called only on the probe worker. A previous run's reply must not satisfy this request.
+private func waitForLiveReply(at url: URL, runID: String) throws -> LiveReply {
+    let deadline = DispatchTime.now() + .seconds(135)
+    while DispatchTime.now() < deadline {
+        do {
+            let data = try Data(contentsOf: url)
+            guard let reply = try? JSONDecoder().decode(LiveReply.self, from: data) else {
+                throw Failure("Invalid live response JSON")
+            }
+            if reply.runID.utf8.elementsEqual(runID.utf8) { return reply }
+        } catch CocoaError.fileReadNoSuchFile {
+            // The runner has not published its response yet.
+        }
+        Thread.sleep(forTimeInterval: 0.25)
+    }
+    throw Failure("Timed out waiting for a matching live response")
+}
+
+private func makeLiveProposal(runID: String) throws -> (Proposal, LiveEvidence) {
+    let marker = "\nReference: \(runID)"
+    let (home, before) = try seedReview(Data(("Meeting: Tuesday at 10:00" + marker).utf8))
+    let request = LiveRequest(runID: runID, original: String(decoding: before, as: UTF8.self))
+    let directory = try documents()
+    try JSONEncoder().encode(request).write(to: directory.appendingPathComponent("live-request.json"), options: .atomic)
+
+    let reply = try waitForLiveReply(at: directory.appendingPathComponent("live-response.json"), runID: runID)
+    guard reply.error == nil else { throw Failure("Live proposal generation failed") }
+    guard let text = reply.candidate, let model = reply.model, let id = reply.responseID,
+          !model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+          !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw Failure("Incomplete live response") }
+    let candidate = Data(text.utf8)
+    guard candidate == Data(("Meeting: Thursday at 14:00" + marker).utf8) else {
+        throw Failure("Live candidate does not match the requested edit")
+    }
+    let snapshot = try Data(contentsOf: home.appendingPathComponent(documentName))
+    guard snapshot == before else { throw Failure("Document changed during proposal generation") }
+    return (Proposal(home: home, before: before, after: candidate),
+            LiveEvidence(model: model, responseID: id, candidateSHA256: digest(candidate), beforeApprovalSHA256: digest(snapshot)))
 }
 
 private enum Decision { case reject, allow }
@@ -106,9 +164,9 @@ private func decide(_ choice: Decision, on proposal: Proposal) throws -> Reply {
     }
 }
 
-private func performProbe(runID: String) throws -> ResultRecord {
+private func performProbe(runID: String?, liveProposal: Bool) throws -> ResultRecord {
     let destination = try documents().appendingPathComponent("probe-result.json")
-    var r = ResultRecord(runID: runID)
+    var r = ResultRecord(runID: runID ?? "manual")
     do {
         let home = try freshHome()
         var rng = SystemRandomNumberGenerator()
@@ -122,7 +180,15 @@ private func performProbe(runID: String) throws -> ResultRecord {
         r.receivedSHA256 = digest(reply.bytes)
         guard reply.bytes == expected, try Data(contentsOf: file) == expected else { throw Failure("32-byte readback mismatch") }
 
-        let p = try makeReviewProposal()
+        let p: Proposal
+        if liveProposal {
+            guard let id = runID, !id.isEmpty, !id.hasPrefix("--") else { throw Failure("Live mode requires --run-id") }
+            let (proposal, evidence) = try makeLiveProposal(runID: id)
+            p = proposal
+            r.live = evidence
+        } else {
+            p = try makeReviewProposal()
+        }
         r.approval.beforeSHA256 = digest(p.before)
         r.approval.previewSHA256 = digest(p.after)
         let rejected = try decide(.reject, on: p)
@@ -178,9 +244,10 @@ final class ProbeView: UIViewController {
         let args = ProcessInfo.processInfo.arguments
         if args.contains("--probe") {
             [preview, create, reject, allow].forEach { $0.isHidden = true }
-            let runID = args.firstIndex(of: "--run-id").flatMap { args.dropFirst($0 + 1).first } ?? "manual"
+            let runID = args.firstIndex(of: "--run-id").flatMap { args.dropFirst($0 + 1).first }
+            let liveProposal = args.contains("--live-proposal")
             status.text = "Running isolated probes…"
-            work({ try performProbe(runID: runID) }) { r in
+            work({ try performProbe(runID: runID, liveProposal: liveProposal) }) { r in
                 self.status.text = r.code == 0 ? r.uuid : r.error
             }
         }

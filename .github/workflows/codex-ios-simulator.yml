@@ -1,6 +1,11 @@
 name: Codex iPhone simulator thread probe
 on:
   workflow_dispatch:
+    inputs:
+      live_proposal:
+        description: 'Request at most one paid model edit from the configured provider'
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -62,6 +67,10 @@ jobs:
           cargo rustc -p ios-probe-bridge --lib --target "$TARGET" -- --print native-static-libs 2>&1 | tee "$PROBE_OUTPUT_DIR/rust.log"
           test -s "target/$TARGET/debug/libios_probe_bridge.a"
       - name: Link Swift app and verify app-server session
+        env:
+          LIVE_PROPOSAL: ${{ inputs.live_proposal && '1' || '0' }}
+          MODEL_API_KEY: ${{ inputs.live_proposal && secrets.MODEL_API_KEY || '' }}
+          MODEL_BASE_URL: ${{ vars.MODEL_BASE_URL }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
