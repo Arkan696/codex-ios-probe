@@ -45,8 +45,9 @@ class LiveRelayTests(unittest.TestCase):
         self.addCleanup(transport.stop)
         self.conn = self.connect.return_value
         self.catalog = {'data': [{'id': i} for i in ('gpt-6.2-astra', 'gpt-4o-mini-audio', 'gpt-4o-mini')]}
-        self.message = dict(type='message', role='assistant', content=[dict(type='output_text', text=EDIT)])
-        self.result = dict(status='completed', id='resp_73', model='resolved-model-2026', output=[self.message])
+        self.message = dict(role='assistant', content=EDIT)
+        self.choice = dict(message=self.message, finish_reason='stop')
+        self.result = dict(id='resp_73', model='resolved-model-2026', choices=[self.choice])
 
     def serve(self, *replies):
         self.conn.getresponse.side_effect = replies
@@ -75,9 +76,11 @@ class LiveRelayTests(unittest.TestCase):
             self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
         get, post = [c.args for c in self.conn.request.call_args_list]
         self.assertEqual(get[:3], ('GET', '/v1/models', None))
-        self.assertEqual(post[:2], ('POST', '/v1/responses'))
-        self.assertEqual(json.loads(post[2]), dict(model='gpt-4o-mini', input=ORIGINAL,
-                         instructions=INSTRUCTION + ' Return only the full edited document. Keep the original language, 24-hour time format and line breaks. No markdown or explanation.', max_output_tokens=256, store=False))
+        self.assertEqual(post[:2], ('POST', '/v1/chat/completions'))
+        payload = json.loads(post[2]); self.assertEqual(payload['model'], 'gpt-4o-mini')
+        self.assertEqual(payload['messages'][1], dict(role='user', content=INSTRUCTION + '\n\n' + ORIGINAL))
+        self.assertEqual(payload['messages'][0]['role'], 'system'); self.assertNotIn(EDIT, post[2].decode())
+        self.assertFalse(payload['stream']); self.assertEqual(payload['max_tokens'], 512)
         self.assertTrue(all(c[3]['Authorization'] == 'Bearer ' + KEY for c in (get, post)))
         self.assertEqual(json.loads(self.dest.read_bytes()), dict(runID=NONCE, candidate=EDIT,
                          model='resolved-model-2026', responseID='resp_73'))
@@ -95,6 +98,10 @@ class LiveRelayTests(unittest.TestCase):
         self.connect.assert_not_called()
         self.assertFalse(self.dest.exists())
 
+    def test_flash_preferred_only_when_advertised(self):
+        self.serve(Reply({'data': [{'id': 'deepseek-v4-flash'}, {'id': 'gpt-4o-mini'}]}), Reply(self.result))
+        self.assertEqual(json.loads(self.conn.request.call_args.args[2])['model'], 'deepseek-v4-flash')
+
     def test_discovery_fallback_only_to_advertised_model(self):
         self.serve(Reply({'data': [{'id': 'gpt-6.2-astra'}]}), Reply(self.result))
         self.assertEqual(json.loads(self.conn.request.call_args.args[2])['model'], 'gpt-6.2-astra')
@@ -107,16 +114,18 @@ class LiveRelayTests(unittest.TestCase):
         for status in (307, 401, 429, 503):
             self.conn.reset_mock()
             bad = Reply(KEY.encode(), status)
-            with self.assertRaisesRegex(relay.RelayError, f'^Live relay /v1/responses: HTTP {status}$'):
+            with self.assertRaisesRegex(relay.RelayError, f'^Live relay /v1/chat/completions: HTTP {status}$'):
                 self.serve(Reply(self.catalog), bad)
             self.assertEqual(bad.read_sizes, [])
             self.assertEqual(self.conn.request.call_count, 2)
             self.assertFalse(self.dest.exists())
 
     def test_unacceptable_generation_never_published_or_retried(self):
-        bad_text = dict(self.message, content=[dict(type='output_text', text=EDIT + '\n')])
-        for update in (dict(output=[]), dict(output=[bad_text]), dict(output=[self.message] * 2),
-                       dict(status='incomplete'), dict(id=None), dict(model=KEY)):
+        bad_text = dict(self.choice, message=dict(self.message, content=EDIT + '\n'))
+        for update in (dict(choices=[]), dict(choices=[bad_text]), dict(choices=[self.choice] * 2),
+                       dict(choices=[dict(self.choice, finish_reason='length')]),
+                       dict(choices=[dict(self.choice, message=dict(self.message, tool_calls=[{}]))]),
+                       dict(id=None), dict(model=KEY)):
             self.conn.reset_mock()
             with self.assertRaises(relay.RelayError) as caught:
                 self.serve(Reply(self.catalog), Reply({**self.result, **update}))
@@ -125,13 +134,13 @@ class LiveRelayTests(unittest.TestCase):
             self.assertFalse(self.dest.exists())
 
     def test_bounded_reads_and_sanitized_transport_failure(self):
-        for failure in (Reply(b'x' * 16385), Reply(KEY.encode()), OSError(KEY)):
+        for failure in (Reply(b'x' * 32769), Reply(KEY.encode()), OSError(KEY)):
             self.conn.reset_mock()
             with self.assertRaisesRegex(relay.RelayError, '^Live relay: generation failed or malformed response$') as e:
                 self.serve(Reply(self.catalog), failure)
             self.assertIsNone(e.exception.__context__)
             if isinstance(failure, Reply):
-                self.assertEqual(failure.read_sizes, [16385])
+                self.assertEqual(failure.read_sizes, [32769])
             self.assertEqual(self.conn.request.call_count, 2)
             self.assertFalse(self.dest.exists())
 
