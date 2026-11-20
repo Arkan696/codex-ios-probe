@@ -1,0 +1,86 @@
+name: Codex iPhone simulator thread probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  simulator:
+    runs-on: macos-15
+    timeout-minutes: 110
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_TERM_COLOR: never
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      IPHONEOS_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: openai/codex
+          ref: 7642e80723386d113ee5c95647164f72e3d68d6d
+          path: upstream
+          persist-credentials: false
+      - name: Prepare simulator SDK and Rust target
+        working-directory: upstream/codex-rs
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in arm64) target=aarch64-apple-ios-sim ;; x86_64) target=x86_64-apple-ios ;; *) exit 1 ;; esac
+          echo "TARGET=$target" >> "$GITHUB_ENV"
+          echo "PROBE_OUTPUT_DIR=$RUNNER_TEMP/sim-evidence" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/sim-evidence"
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          tc=$(python3 -c 'import re;print(re.search(r"channel\s*=\s*\"([^\"]+)\"",open("rust-toolchain.toml").read())[1])')
+          rustup toolchain install "$tc" --profile minimal --target "$target"
+          echo "RUSTUP_TOOLCHAIN=$tc" >> "$GITHUB_ENV"
+          command -v protoc || brew install protobuf
+      - name: Prepare pinned MXC checkout and bridge
+        working-directory: upstream/codex-rs
+        run: |
+          set -euo pipefail
+          cargo fetch --locked --target "$TARGET"
+          shopt -s nullglob
+          matches=()
+          for d in "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/mxc-*/*; do
+            if [[ -f "$d/src/mxc-sdk/src/core/mxc_engine/dispatch.rs" && "$(git -C "$d" rev-parse HEAD)" == c66201839d63cae2239db5e92f1f1d6076cf5181 ]]; then matches+=("$d"); fi
+          done
+          [[ ${#matches[@]} == 1 ]]
+          git -C "${matches[0]}" apply "$GITHUB_WORKSPACE/mxc-ios-probe.patch"
+          cp -R "$GITHUB_WORKSPACE/simulator/bridge" ios-probe-bridge
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Cargo.toml'); s = p.read_text(); anchor = '\nmembers = [\n'; assert s.count(anchor) == 1
+          p.write_text(s.replace(anchor, anchor + '    "ios-probe-bridge",\n'))
+          PY
+      - name: Build simulator static library and capture native linker flags
+        working-directory: upstream/codex-rs
+        run: |
+          set -euo pipefail
+          cargo rustc -p ios-probe-bridge --lib --target "$TARGET" -- --print native-static-libs 2>&1 | tee "$PROBE_OUTPUT_DIR/rust.log"
+          test -s "target/$TARGET/debug/libios_probe_bridge.a"
+      - name: Link Swift app and verify app-server session
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, shlex, subprocess
+          out=pathlib.Path(os.environ['PROBE_OUTPUT_DIR']); root=pathlib.Path.cwd()
+          lines=[l.split('native-static-libs:',1)[1] for l in (out/'rust.log').read_text().splitlines() if l.startswith('note: native-static-libs:')]
+          if not lines: raise SystemExit('Rust did not report native linker inputs')
+          flags=[s for tok in shlex.split(lines[-1]) for s in ('-Xlinker',tok)]
+          lib=root/'upstream/codex-rs/target'/os.environ['TARGET']/'debug/libios_probe_bridge.a'
+          subprocess.run(['bash',str(root/'simulator/app/run.sh'),str(lib),*flags],check=True)
+          PY
+      - name: Save compiler and runtime evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-probe-evidence
+          path: |
+            ${{ runner.temp }}/sim-evidence/*.log
+            ${{ runner.temp }}/sim-evidence/result.json
+            ${{ runner.temp }}/sim-evidence/failure.txt
+          if-no-files-found: warn
+          retention-days: 7
