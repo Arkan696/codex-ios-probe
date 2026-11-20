@@ -39,7 +39,20 @@ def sim(*args, **kwargs):
 
 
 def device():
-    inventory = json.loads(sim('list', '--json'))
+    for attempt in (1, 2):
+        try:
+            inventory = json.loads(sim('list', '--json', timeout=180))
+            break
+        except subprocess.TimeoutExpired:
+            with (out / 'runner.log').open('a') as log:
+                print(f'simctl inventory attempt {attempt}/2 timed out after 180s', file=log)
+            if attempt == 2:
+                try:
+                    run('/usr/bin/log', 'show', '--last', '7m', '--style', 'compact',
+                        '--predicate', 'process == "com.apple.CoreSimulator.CoreSimulatorService"', timeout=30)
+                except Exception as exc:
+                    print('CoreSimulator diagnostics unavailable:', exc, file=sys.stderr)
+                raise
     runtimes = [r for r in inventory['runtimes'] if r['isAvailable'] and
                 '.SimRuntime.iOS-' in r['identifier'] and int(r['version'].split('.')[0]) >= 15]
     runtimes.sort(key=lambda r: tuple(map(int, r['version'].split('.'))), reverse=True)
