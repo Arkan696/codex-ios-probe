@@ -128,7 +128,12 @@ def smoke(lib, flags):
         if not container.is_absolute() or not container.is_dir():
             raise ValueError(f'Unexpected simulator data container: {container}')
         result = container / 'Documents/probe-result.json'
-        sim('launch', '--terminate-running-process', udid, BUNDLE, '--probe', '--run-id', nonce)
+        try:
+            sim('launch', '--terminate-running-process', udid, BUNDLE, '--probe', '--run-id', nonce)
+        except subprocess.TimeoutExpired:
+            # The simulator may already have delivered the launch. Do not relaunch.
+            with (out / 'runner.log').open('a') as log:
+                print('simctl launch timed out; checking only this run ID for 120s', file=log)
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             if result.exists():
@@ -143,7 +148,7 @@ def smoke(lib, flags):
     finally:
         try:
             logs = sim('spawn', udid, 'log', 'show', '--last', '5m', '--style', 'compact',
-                       '--predicate', 'process == "Probe"', timeout=30)
+                       '--predicate', 'process == "Probe" OR ((process == "SpringBoard" OR process == "runningboardd" OR process == "ReportCrash") AND eventMessage CONTAINS[c] "org.local.codexprobe")', timeout=30)
             (out / 'app.log').write_text(logs + '\n')
         except Exception as exc:
             print('Diagnostic log unavailable:', exc, file=sys.stderr)
