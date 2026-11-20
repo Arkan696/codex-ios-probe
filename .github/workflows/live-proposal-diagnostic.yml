@@ -1,0 +1,41 @@
+name: Standalone live proposal diagnostic
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check diagnostic and relay offline
+        run: python3 -B -m unittest discover -s simulator/app -p 'test*.py'
+      - name: Diagnose one synthetic edit without simulator
+        env:
+          MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+        run: |
+          set -eu
+          cd simulator/app
+          python3 -B - <<'PY'
+          import json, os, secrets, tempfile
+          from pathlib import Path
+          from live_relay import RelayError, service
+          nonce = secrets.token_hex(16)
+          with tempfile.TemporaryDirectory() as tmp:
+              root = Path(tmp)
+              docs = root / 'Documents'
+              docs.mkdir()
+              req = dict(runID=nonce, original=f'Meeting: Tuesday at 10:00\nReference: {nonce}', instruction='把会议改到周四下午两点，其他内容不变。')
+              (docs / 'live-request.json').write_text(json.dumps(req), encoding='utf-8')
+              try:
+                  service(root, nonce, os.environ.pop('MODEL_API_KEY', ''))
+              except RelayError as err:
+                  raise SystemExit(str(err))
+              record = json.loads((docs / 'live-response.json').read_bytes())
+              if record['runID'] != nonce or record['candidate'] != f'Meeting: Thursday at 14:00\nReference: {nonce}':
+                  raise SystemExit('Standalone diagnostic: evidence mismatch')
+              print('Standalone diagnostic: candidate matched exactly')
+          PY
