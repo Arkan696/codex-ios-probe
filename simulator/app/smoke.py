@@ -136,6 +136,15 @@ def validate(record, nonce):
     digest = record.get('expectedSHA256', '')
     if record.get('byteCount') != 32 or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest) or digest != record.get('receivedSHA256'):
         raise ValueError('No matching 32-byte fs/readFile evidence')
+    a = record.get('approval') or {}
+    def is_digest(x):
+        return isinstance(x, str) and len(x) == 64 and all(c in '0123456789abcdef' for c in x)
+    old, new = a.get('beforeSHA256'), a.get('previewSHA256')
+    if not (is_digest(old) and is_digest(new) and old != new
+            and a.get('rejectedSHA256') == old and a.get('approvedSHA256') == new
+            and type(a.get('rejectedWrites')) is int and a['rejectedWrites'] == 0
+            and type(a.get('approvedWrites')) is int and a['approvedWrites'] == 1):
+        raise ValueError('Missing approval evidence: reject must preserve original with zero writes; allow must write preview once')
     return text
 
 
@@ -161,8 +170,8 @@ def smoke(lib, flags):
         except subprocess.TimeoutExpired:
             # The simulator may already have delivered the launch. Do not relaunch.
             with (out / 'runner.log').open('a') as log:
-                print('simctl launch timed out; checking only this run ID for 120s', file=log)
-        deadline = time.monotonic() + 120
+                print('simctl launch timed out; checking only this run ID for 300s', file=log)
+        deadline = time.monotonic() + 300  # read regression plus both decision paths
         while time.monotonic() < deadline:
             if result.exists():
                 raw = result.read_bytes()  # App publishes by atomic rename.
@@ -172,7 +181,7 @@ def smoke(lib, flags):
                     print('Session UUID:', validate(record, nonce), flush=True)
                     return
             time.sleep(0.5)
-        raise TimeoutError('No fresh Documents/probe-result.json within 120 seconds')
+        raise TimeoutError('No fresh Documents/probe-result.json within 300 seconds')
     finally:
         try:
             logs = sim('spawn', udid, 'log', 'show', '--last', '5m', '--style', 'compact',

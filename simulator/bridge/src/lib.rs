@@ -2,7 +2,10 @@
 
 use anyhow::{Context, Result, anyhow, ensure};
 use codex_app_server::in_process::{self, InProcessClientHandle, InProcessStartArgs};
-use codex_app_server_protocol::{ClientInfo, ClientRequest, FsReadFileParams, FsReadFileResponse, InitializeParams, RequestId, ThreadStartParams, ThreadStartResponse};
+use codex_app_server_protocol::{
+    ClientInfo, ClientRequest, FsReadFileParams, FsReadFileResponse, FsWriteFileParams,
+    InitializeParams, RequestId, ThreadStartParams, ThreadStartResponse,
+};
 use codex_config::{LoaderOverrides, NoopThreadConfigLoader};
 use codex_core::config::ConfigBuilder;
 use codex_exec_server::EnvironmentManager;
@@ -71,7 +74,20 @@ async fn start(home: &Path) -> Result<InProcessClientHandle> {
     Ok(Box::pin(in_process::start(args)).await.context("initialize embedded app-server")?)
 }
 
-async fn probe(home: &Path) -> Result<String> {
+enum Probe {
+    Challenge,
+    Review(Option<String>),
+}
+
+async fn rpc(client: &InProcessClientHandle, request: ClientRequest) -> Result<serde_json::Value> {
+    let method = request.method_name();
+    timeout(DEADLINE, client.request(request)).await
+        .with_context(|| format!("{method} timed out"))?
+        .with_context(|| format!("{method} transport"))?
+        .map_err(|e| anyhow!("{method} RPC {}: {}", e.code, e.message))
+}
+
+async fn probe(home: &Path, mode: Probe) -> Result<String> {
     let client = timeout(DEADLINE, start(home)).await.context("app-server startup timed out")??;
     let request = ClientRequest::ThreadStart {
         request_id: RequestId::Integer(1), // initialize uses 0
@@ -82,17 +98,29 @@ async fn probe(home: &Path) -> Result<String> {
         },
     };
     let result: Result<String> = async {
-        let value = timeout(DEADLINE, client.request(request)).await.context("thread/start timed out")?
-            .context("thread/start transport")?.map_err(|e| anyhow!("thread/start RPC {}: {}", e.code, e.message))?;
-        let response: ThreadStartResponse = serde_json::from_value(value)?;
+        let response: ThreadStartResponse = serde_json::from_value(rpc(&client, request).await?)?;
         let id = ThreadId::from_string(&response.thread.id)?;
-        // Hard-coded relative name under the fresh test container; no caller-supplied path.
-        let params = FsReadFileParams { path: home.join("challenge.bin").try_into()? };
-        let request = ClientRequest::FsReadFile { request_id: RequestId::Integer(2), params };
-        let value = timeout(DEADLINE, client.request(request)).await.context("fs/readFile timed out")?
-            .context("fs/readFile transport")?.map_err(|e| anyhow!("fs/readFile RPC {}: {}", e.code, e.message))?;
-        let read: FsReadFileResponse = serde_json::from_value(value)?;
-        Ok(serde_json::json!({"uuid":id.to_string(),"base64":read.data_base64}).to_string())
+        let name = match &mode {
+            Probe::Challenge => "challenge.bin",
+            Probe::Review(_) => "review.txt",
+        };
+        let params = FsReadFileParams { path: home.join(name).try_into()? };
+        let mut writes = 0;
+        let is_review = matches!(&mode, Probe::Review(_));
+        if let Probe::Review(Some(data_base64)) = mode {
+            rpc(&client, ClientRequest::FsWriteFile {
+                request_id: RequestId::Integer(2),
+                params: FsWriteFileParams { path: params.path.clone(), data_base64 },
+            }).await?;
+            writes += 1;
+        }
+        let request = ClientRequest::FsReadFile { request_id: RequestId::Integer(2 + writes), params };
+        let read: FsReadFileResponse = serde_json::from_value(rpc(&client, request).await?)?;
+        let mut reply = serde_json::json!({"uuid": id.to_string(), "base64": read.data_base64});
+        if is_review {
+            reply["writes"] = writes.into();
+        }
+        Ok(reply.to_string())
     }.await;
     let shutdown = client.shutdown().await;
     let reply = result?;
@@ -100,14 +128,14 @@ async fn probe(home: &Path) -> Result<String> {
     Ok(reply)
 }
 
-fn run(home: PathBuf) -> Result<String> {
+fn run(home: PathBuf, mode: Probe) -> Result<String> {
     ensure!(home.is_absolute(), "home must be an absolute directory path");
     std::fs::create_dir_all(&home).context("create probe home")?;
     // Do not nest block_on in the caller's runtime or poll Codex startup on an iOS UI stack.
     std::thread::Builder::new().name("codex-probe".into()).stack_size(STACK).spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2)
             .thread_stack_size(STACK).enable_all().build().context("create Tokio runtime")?;
-        let result = rt.block_on(Box::pin(probe(&home)));
+        let result = rt.block_on(Box::pin(probe(&home, mode)));
         rt.shutdown_timeout(Duration::from_secs(2));
         result
     }).context("spawn probe worker")?.join().map_err(|_| anyhow!("probe worker panicked"))?
@@ -121,18 +149,47 @@ fn run(home: PathBuf) -> Result<String> {
 /// Use a 4096-byte output buffer. Diagnostics may be truncated to fit.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn codex_probe(home: *const c_char, out: *mut c_char, cap: usize) -> i32 {
+    unsafe { ffi_probe(home, out, cap, || Ok(Probe::Challenge)) }
+}
+
+/// Reads `review.txt`, optionally writing the approved base64 payload first.
+///
+/// # Safety
+/// `home`, `out`, and `cap` have the same requirements as in `codex_probe`.
+/// `approved_b64` must be null or a readable NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn codex_edit_probe(
+    home: *const c_char, approved_b64: *const c_char, out: *mut c_char, cap: usize,
+) -> i32 {
+    let mode = || {
+        let approved = if approved_b64.is_null() {
+            None
+        } else {
+            let data = unsafe { CStr::from_ptr(approved_b64) }.to_str()
+                .context("approved_b64 is not UTF-8")?;
+            Some(data.to_owned())
+        };
+        Ok(Probe::Review(approved))
+    };
+    unsafe { ffi_probe(home, out, cap, mode) }
+}
+
+unsafe fn ffi_probe(
+    home: *const c_char, out: *mut c_char, cap: usize,
+    mode: impl FnOnce() -> Result<Probe> + std::panic::UnwindSafe,
+) -> i32 {
     if out.is_null() || cap == 0 { return 1; }
     let result = std::panic::catch_unwind(|| -> Result<String> {
         ensure!(cap >= 4096, "need 4096 output bytes");
         ensure!(!home.is_null(), "home is null");
         let path = unsafe { CStr::from_ptr(home) }.to_str().context("home is not UTF-8")?;
-        run(PathBuf::from(path))
+        run(PathBuf::from(path), mode()?)
     });
     let (status, text) = match result {
         Ok(Ok(reply)) if reply.len() < cap => (0, reply),
         Ok(Ok(_)) => (1, "reply exceeds buffer".into()),
         Ok(Err(error)) => (1, format!("{error:#}")),
-        Err(_) => (1, "panic in codex_probe".to_owned()),
+        Err(_) => (1, "panic in probe bridge".to_owned()),
     };
     let len = text.floor_char_boundary(text.len().min(cap - 1));
     unsafe {
