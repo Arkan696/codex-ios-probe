@@ -34,7 +34,10 @@ def preview(source, day, clock):
 def diagnose(key, source):
     if not key:
         raise RelayError('field diagnostic: missing credential')
-    response = _api(key, '/v1/chat/completions', dict(model=_MODEL, stream=False, max_tokens=512,
+    schema = {'type': 'object', 'properties': {'weekday': {'type': 'string', 'enum': DAYS},
+              'time': {'type': 'string'}}, 'required': ['weekday', 'time'], 'additionalProperties': False}
+    fmt = {'type': 'json_schema', 'json_schema': {'name': 'meeting_fields', 'strict': True, 'schema': schema}}
+    response = _api(key, '/v1/chat/completions', dict(model=_MODEL, stream=False, max_tokens=512, response_format=fmt,
                     messages=[dict(role='system', content=SYSTEM), dict(role='user', content=_INSTRUCTION)]), 32768)
     choices = response.get('choices') or []
     if len(choices) != 1 or choices[0].get('finish_reason') != 'stop':

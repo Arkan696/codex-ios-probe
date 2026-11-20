@@ -14,7 +14,8 @@ class FieldTests(unittest.TestCase):
         res = {'choices':[{'finish_reason':'stop','message':{'role':'assistant','content':'{"weekday":"Thursday","time":"14:00"}'}}]}
         with patch.object(f, '_api', return_value=res) as call:
             self.assertEqual(f.diagnose('test', source), b'Meeting: Thursday at 14:00\r\nReference: private-sample\x00\xff')
-            call.assert_called_once(); payload=json.dumps(call.call_args.args[2]); self.assertNotIn('Reference',payload); self.assertNotIn('private-sample',payload); self.assertNotIn('Tuesday',payload)
+            call.assert_called_once(); request=call.call_args.args[2]; messages=json.dumps(request['messages']); self.assertNotIn('Reference',messages); self.assertNotIn('private-sample',messages); self.assertNotIn('Tuesday',messages)
+            fmt=request['response_format']; self.assertEqual(fmt['type'],'json_schema'); spec=fmt['json_schema']; self.assertIs(spec['strict'],True); schema=spec['schema']; self.assertIs(schema['additionalProperties'],False); self.assertEqual(schema['required'],['weekday','time']); self.assertEqual(schema['properties']['weekday']['enum'], f.DAYS); self.assertNotIn('14:00',json.dumps(schema))
 
     def test_wrong_time_no_preview(self):
         msg={'role':'assistant','content':'{"weekday":"Friday","time":"14:00"}'}
