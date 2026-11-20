@@ -26,7 +26,15 @@ def run(*argv, timeout=60):
             try:
                 text, _ = p.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                os.killpg(p.pid, signal.SIGKILL)
+                print(f'{shlex.join(args)} timed out after {timeout}s', file=log, flush=True)
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except OSError as cleanup:
+                    print(f'Process-group cleanup: {cleanup}', file=log, flush=True)
+                    try:
+                        p.kill()
+                    except OSError as direct:
+                        print(f'Child cleanup: {direct}', file=log, flush=True)
                 raise
             print(text, file=log)
             if p.returncode:
@@ -79,7 +87,7 @@ def build(lib, flags, arch):
     run('xcrun', 'lipo', lib, '-verify_arch', arch)
     bundle = out / 'Probe.app'
     bundle.mkdir()
-    plist = dict(CFBundleIdentifier=BUNDLE, CFBundleExecutable='Probe', CFBundleName='Probe',
+    plist = dict(ProbeBuildNonce=nonce, CFBundleIdentifier=BUNDLE, CFBundleExecutable='Probe', CFBundleName='Probe',
                  CFBundleVersion='1', CFBundleShortVersionString='1.0', CFBundlePackageType='APPL',
                  CFBundleInfoDictionaryVersion='6.0', CFBundleSupportedPlatforms=['iPhoneSimulator'],
                  DTPlatformName='iphonesimulator', MinimumOSVersion=MIN, LSRequiresIPhoneOS=True,
@@ -96,6 +104,26 @@ def build(lib, flags, arch):
     run('/usr/bin/codesign', '--force', '--sign', '-', '--timestamp=none', bundle)
     run('/usr/bin/codesign', '--verify', '--strict', bundle)
     return bundle
+
+
+def install_checked(udid, bundle):
+    try:
+        sim('install', udid, bundle, timeout=120)
+    except subprocess.TimeoutExpired as original:
+        try:
+            path = Path(sim('get_app_container', udid, BUNDLE, 'app', timeout=60))
+            if not path.is_absolute():
+                raise ValueError('No absolute installed app path')
+            with (path / 'Info.plist').open('rb') as stream:
+                info = plistlib.load(stream)
+            if info.get('CFBundleIdentifier') != BUNDLE or info.get('ProbeBuildNonce') != nonce:
+                raise ValueError('Installed app is not from this run')
+        except Exception as check:
+            with (out / 'runner.log').open('a') as log:
+                print(f'Install timeout; current build not confirmed: {check}', file=log)
+            raise original from check
+        with (out / 'runner.log').open('a') as log:
+            print('Install timed out but current build nonce verified; continuing', file=log)
 
 
 def validate(record, nonce):
@@ -123,7 +151,7 @@ def smoke(lib, flags):
     udid, created = device()
     try:
         sim('bootstatus', udid, '-b', timeout=300)
-        sim('install', udid, bundle, timeout=120)
+        install_checked(udid, bundle)
         container = Path(sim('get_app_container', udid, BUNDLE, 'data'))
         if not container.is_absolute() or not container.is_dir():
             raise ValueError(f'Unexpected simulator data container: {container}')
