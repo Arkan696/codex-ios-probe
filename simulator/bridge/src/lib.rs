@@ -34,7 +34,14 @@ async fn start(home: &Path) -> Result<InProcessClientHandle> {
         .loader_overrides(loader_overrides.clone())
         .cli_overrides(cli_overrides.clone())
         .build().await.context("load probe config")?;
-    let environment_manager = Arc::new(EnvironmentManager::from_codex_home(home, None, config.http_client_factory()).await.context("configure local filesystem")?);
+    // The embedded host is this app. The file probe never requests a helper process.
+    let app_exe = std::env::current_exe().context("resolve simulator app executable")?;
+    let runtime = codex_exec_server::ExecServerRuntimeOptions::new(app_exe, None)
+        .context("configure embedded host path")?;
+    let environment_manager = Arc::new(
+        EnvironmentManager::from_codex_home(home, Some(runtime), config.http_client_factory())
+            .await.context("configure local filesystem")?,
+    );
     let args = InProcessStartArgs {
         arg0_paths: Default::default(),
         config: Arc::new(config),
