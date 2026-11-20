@@ -39,8 +39,13 @@ def diagnose(key, source):
     fmt = {'type': 'json_schema', 'json_schema': {'name': 'meeting_fields', 'strict': True, 'schema': schema}}
     response = _api(key, '/v1/chat/completions', dict(model=_MODEL, stream=False, max_tokens=512, response_format=fmt,
                     messages=[dict(role='system', content=SYSTEM), dict(role='user', content=_INSTRUCTION)]), 32768)
-    choices = response.get('choices') or []
-    if len(choices) != 1 or choices[0].get('finish_reason') != 'stop':
+    choices = response.get('choices') if isinstance(response, dict) else None
+    count = len(choices) if isinstance(choices, list) else 'unavailable'
+    raw_reason = (choices[0].get('finish_reason') if count == 1 and isinstance(choices[0], dict) else None)
+    reason = (raw_reason if raw_reason in ('stop','length','tool_calls','function_call','content_filter')
+              else 'missing' if raw_reason is None else 'other') if count == 1 else 'not_applicable'
+    print(f'field diagnostic: choices={count} finish_reason={reason}', flush=True)
+    if count != 1 or reason != 'stop':
         raise RelayError('field diagnostic: no complete single reply')
     msg = choices[0].get('message') or {}
     if msg.get('role') != 'assistant' or any(msg.get(k) for k in ('tool_calls','function_call','refusal')):
