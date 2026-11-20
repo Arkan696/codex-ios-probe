@@ -38,6 +38,32 @@ jobs:
             rustc +"$toolchain" -Vv
             command -v protoc || brew install protobuf
           } 2>&1 | tee "$RUNNER_TEMP/setup.log"
+      - name: Fetch probe patch at this workflow revision
+        uses: actions/checkout@v4
+        with:
+          path: probe-inputs
+          persist-credentials: false
+      - name: Apply three MXC platform guards to the pinned Cargo checkout
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            cargo fetch --locked --target "$TARGET"
+            rev=c66201839d63cae2239db5e92f1f1d6076cf5181
+            shopt -s nullglob
+            matches=()
+            for d in "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/mxc-*/*; do
+              if [[ -f "$d/src/mxc-sdk/src/core/mxc_engine/dispatch.rs" && "$(git -C "$d" rev-parse HEAD)" == "$rev" ]]; then
+                matches+=("$d")
+              fi
+            done
+            [[ ${#matches[@]} == 1 ]] || { echo "Expected one pinned MXC checkout, found ${#matches[@]}"; exit 1; }
+            patch="$GITHUB_WORKSPACE/probe-inputs/mxc-ios-probe.patch"
+            git -C "${matches[0]}" apply --check "$patch"
+            git -C "${matches[0]}" apply "$patch"
+            git -C "${matches[0]}" diff --stat
+          } 2>&1 | tee "$RUNNER_TEMP/patch.log"
       - name: Compile official app-server library for iPhone
         working-directory: codex-rs
         shell: bash
@@ -52,6 +78,7 @@ jobs:
           name: codex-ios-probe-logs
           path: |
             ${{ runner.temp }}/setup.log
+            ${{ runner.temp }}/patch.log
             ${{ runner.temp }}/build.log
           retention-days: 7
           if-no-files-found: warn
