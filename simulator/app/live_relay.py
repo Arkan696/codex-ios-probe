@@ -55,6 +55,18 @@ def _api(key, path, payload, limit):
         conn.close()
 
 
+def _mismatch(candidate, nonce):
+    # Only fixed labels leave this function. Normalization is diagnostic, not acceptance.
+    if not isinstance(candidate, str):
+        return 'content=nontext'
+    expected = f'Meeting: Thursday at 14:00\nReference: {nonce}'
+    lines = [line.strip() for line in candidate.splitlines()]
+    target = 'Meeting: Thursday at 14:00' in lines
+    marker = f'Reference: {nonce}' in lines
+    whitespace = ''.join(candidate.split()) == ''.join(expected.split())
+    return f'target_line={int(target)} reference_line={int(marker)} whitespace_only={int(whitespace)}'
+
+
 def _extract(response, nonce, key):
     choice, = response['choices']
     message = choice['message']
@@ -64,7 +76,7 @@ def _extract(response, nonce, key):
         raise RelayError('Live relay: expected one completed assistant text response')
     candidate = message.get('content')
     if candidate != f'Meeting: Thursday at 14:00\nReference: {nonce}':
-        raise RelayError('Live relay: candidate does not match the required edit')
+        raise RelayError('Live relay: candidate mismatch: ' + _mismatch(candidate, nonce))
     model, rid = response['model'], response['id']
     if not all(isinstance(s, str) and _ID.fullmatch(s) and key not in s for s in (model, rid)):
         raise RelayError('Live relay: invalid upstream identifiers')
